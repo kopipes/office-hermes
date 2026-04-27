@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Any, Literal, Optional
+from uuid import UUID
 
 from fastapi import Depends, FastAPI
 from pydantic import BaseModel, Field
@@ -61,23 +62,34 @@ class StructuredEntryRequest(RequestContext):
     source_name: Optional[str] = None
 
 
+def _safe_uuid(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    try:
+        return str(UUID(str(value)))
+    except (ValueError, TypeError):
+        return None
+
+
 def _log_query(user_id: Optional[str], query_text: str, query_type: str, tools_used: list[str], rows: int, chunks: int, summary: str):
+    safe_user_id = _safe_uuid(user_id)
     execute(
         """
         insert into query_logs (user_id, query_text, query_type, tools_used, rows_returned, chunks_returned, response_summary)
         values (%s, %s, %s, %s, %s, %s, %s)
         """,
-        (user_id, query_text, query_type, tools_used, rows, chunks, summary),
+        (safe_user_id, query_text, query_type, tools_used, rows, chunks, summary),
     )
 
 
 def _log_audit(user_id: Optional[str], action_type: str, table_name: str, record_id: Optional[str], previous: Optional[dict], new: Optional[dict]):
+    safe_user_id = _safe_uuid(user_id)
     execute(
         """
         insert into audit_logs (user_id, action_type, table_name, record_id, previous_value, new_value)
         values (%s, %s, %s, %s, %s::jsonb, %s::jsonb)
         """,
-        (user_id, action_type, table_name, record_id, _to_json(previous), _to_json(new)),
+        (safe_user_id, action_type, table_name, record_id, _to_json(previous), _to_json(new)),
     )
 
 
@@ -384,6 +396,7 @@ def generate_report(req: SearchRequest, _: bool = Depends(require_auth)):
 
 @app.post("/suggest_wiki_update")
 def suggest_wiki_update(req: SuggestWikiRequest, _: bool = Depends(require_auth)):
+    safe_user_id = _safe_uuid(req.user_id)
     page = fetch_one("select id, slug, content from wiki_pages where slug = %s", (req.slug,))
 
     if page:
@@ -392,7 +405,7 @@ def suggest_wiki_update(req: SuggestWikiRequest, _: bool = Depends(require_auth)
             insert into wiki_change_requests (wiki_page_id, proposed_content, change_reason, proposed_by, approval_status)
             values (%s, %s, %s, %s, 'pending_review')
             """,
-            (page["id"], req.content, "Auto suggestion from MCP", req.user_id),
+            (page["id"], req.content, "Auto suggestion from MCP", safe_user_id),
         )
         _log_audit(req.user_id, "insert", "wiki_change_requests", None, None, {"wiki_page_id": page["id"], "rows": rows})
         return {
