@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: provaliant-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-provaliant_brain}
+      POSTGRES_USER: ${POSTGRES_USER:-brain_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-CHANGE_ME_STRONG_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  mcp-server:
+    image: python:3.11-slim
+    container_name: provaliant-mcp
+    working_dir: /app/mcp-server
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./mcp-server:/app/mcp-server
+    command: >
+      sh -c "pip install --no-cache-dir -r requirements.txt &&
+             uvicorn main:app --host ${MCP_HOST:-0.0.0.0} --port ${MCP_PORT:-8000}"
+    depends_on:
+      - postgres
+    ports:
+      - "8000:8000"
+
+volumes:
+  postgres_data:

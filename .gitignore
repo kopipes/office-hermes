@@ -1,0 +1,11 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+backups/
+*.sql.gz
+mcp-server/.venv/
+.DS_Store
