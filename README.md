@@ -39,6 +39,7 @@ bash scripts/run_mcp.sh
 ## Core MCP Endpoints
 - `GET /health`
 - `POST /brain/query`
+- `POST /ingest`
 - `POST /search_db`
 - `POST /search_wiki`
 - `POST /search_evidence`

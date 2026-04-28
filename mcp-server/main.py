@@ -1,7 +1,7 @@
 import hashlib
 import re
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Any, Literal, Optional
 from uuid import UUID
 
@@ -69,6 +69,16 @@ class BrainQueryRequest(RequestContext):
     query: str
     channel: Optional[str] = None
     use_cache: bool = True
+
+
+class IngestRequest(RequestContext):
+    channel: str = "telegram"
+    raw_text: str
+    entry_type: Optional[str] = None
+    extracted: Optional[dict[str, Any]] = None
+    confidence: Optional[float] = None
+    source_type: str = "chat"
+    source_name: Optional[str] = None
 
 
 INTENT_TTL_SECONDS = {
@@ -546,6 +556,593 @@ def _run_brain_tool(tool_name: str, query: str, entities: dict[str, Optional[str
     return data, ["search_db"]
 
 
+SUPPORTED_INGEST_ENTRY_TYPES = {"meeting", "vendor_quote", "budget", "project_update", "contact"}
+
+
+def _extract_kv_pairs(raw_text: str) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    for line in raw_text.splitlines():
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        normalized_key = re.sub(r"[^a-z0-9_]+", "_", key.strip().lower())
+        if normalized_key:
+            pairs[normalized_key] = value.strip()
+    return pairs
+
+
+def _parse_money(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    raw = value.strip().lower().replace(",", ".")
+    number_match = re.search(r"(\d+(?:\.\d+)?)", raw)
+    if not number_match:
+        return None
+    amount = float(number_match.group(1))
+    if any(unit in raw for unit in ["jt", "juta", "mio"]):
+        return amount * 1_000_000
+    if any(unit in raw for unit in ["rb", "ribu", "k"]):
+        return amount * 1_000
+    return amount
+
+
+def _extract_first_money(raw_text: str) -> Optional[float]:
+    match = re.search(r"\b\d+(?:[.,]\d+)?\s*(?:jt|juta|rb|ribu|k)?\b", raw_text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return _parse_money(match.group(0))
+
+
+def _parse_due_date(raw_text: str) -> Optional[date]:
+    normalized = raw_text.lower()
+    today = datetime.utcnow().date()
+
+    if "besok" in normalized or "tomorrow" in normalized:
+        return today + timedelta(days=1)
+
+    weekdays = {
+        "senin": 0,
+        "monday": 0,
+        "selasa": 1,
+        "tuesday": 1,
+        "rabu": 2,
+        "wednesday": 2,
+        "kamis": 3,
+        "thursday": 3,
+        "jumat": 4,
+        "friday": 4,
+        "sabtu": 5,
+        "saturday": 5,
+        "minggu": 6,
+        "sunday": 6,
+    }
+    for token, weekday in weekdays.items():
+        if re.search(rf"\b{re.escape(token)}\b", normalized):
+            delta = (weekday - today.weekday()) % 7
+            if delta == 0:
+                delta = 7
+            return today + timedelta(days=delta)
+
+    explicit_iso = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", raw_text)
+    if explicit_iso:
+        try:
+            return datetime.strptime(explicit_iso.group(1), "%Y-%m-%d").date()
+        except ValueError:
+            return None
+
+    explicit_dmy = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b", raw_text)
+    if explicit_dmy:
+        try:
+            return date(int(explicit_dmy.group(3)), int(explicit_dmy.group(2)), int(explicit_dmy.group(1)))
+        except ValueError:
+            return None
+
+    return None
+
+
+def _extract_entry_type(raw_text: str, explicit_entry_type: Optional[str]) -> tuple[Optional[str], float]:
+    if explicit_entry_type:
+        normalized = explicit_entry_type.strip().lower()
+        if normalized in SUPPORTED_INGEST_ENTRY_TYPES:
+            return normalized, 0.99
+
+    command_match = re.search(r"/entry\s+([a-z_]+)", raw_text.lower())
+    if command_match:
+        detected = command_match.group(1).strip()
+        if detected in SUPPORTED_INGEST_ENTRY_TYPES:
+            return detected, 0.98
+
+    rules = {
+        "meeting": ["meeting", "mom", "notulen", "rapat", "decision", "action item", "discussed", "agreed"],
+        "vendor_quote": ["vendor", "quote", "quotation", "harga", "penawaran", "lead time", "produksi", "booth", "printing"],
+        "budget": ["budget", "internal", "external", "margin", "profit", "cost", "realisasi", "rab"],
+        "project_update": ["status", "update", "blocker", "issue", "delay", "risk", "next step"],
+        "contact": ["contact", "pic", "phone", "email", "whatsapp", "client person"],
+    }
+    normalized = raw_text.lower()
+    scored = []
+    for entry_type, keywords in rules.items():
+        score = sum(1 for keyword in keywords if keyword in normalized)
+        scored.append((score, entry_type))
+
+    scored.sort(reverse=True)
+    best_score, best_type = scored[0]
+    if best_score <= 0:
+        return None, 0.0
+    confidence = min(0.8 + (best_score * 0.03), 0.95)
+    return best_type, confidence
+
+
+def _get_kv_value(pairs: dict[str, str], *keys: str) -> Optional[str]:
+    for key in keys:
+        if key in pairs and pairs[key]:
+            return pairs[key]
+    return None
+
+
+def _extract_with_pattern(raw_text: str, pattern: str) -> Optional[str]:
+    match = re.search(pattern, raw_text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _extract_ingest_payload(entry_type: str, raw_text: str) -> dict[str, Any]:
+    pairs = _extract_kv_pairs(raw_text)
+    project = _get_kv_value(pairs, "project") or _extract_with_pattern(raw_text, r"\bproject\s+([a-z0-9_-]{2,30})")
+    client = _get_kv_value(pairs, "client")
+    vendor = _get_kv_value(pairs, "vendor")
+
+    payload: dict[str, Any] = {
+        "project": project.upper() if project else None,
+        "client": client,
+        "vendor": vendor,
+    }
+
+    if entry_type == "meeting":
+        action_text = _get_kv_value(pairs, "action", "action_item")
+        if not action_text:
+            action_text = _extract_with_pattern(raw_text, r"\baction\s*:?\s*(.+)")
+        decision_text = _get_kv_value(pairs, "decision")
+        if not decision_text:
+            decision_text = _extract_with_pattern(raw_text, r"\bdecision\s*:?\s*(.+?)(?:\baction\b|$)")
+        summary_text = _get_kv_value(pairs, "summary")
+        if not summary_text and decision_text:
+            summary_text = decision_text
+        payload.update(
+            {
+                "summary": summary_text,
+                "decision": decision_text,
+                "action": action_text,
+                "action_owner": _extract_with_pattern(action_text or "", r"^\s*([a-zA-Z][a-zA-Z0-9_-]{1,30})"),
+                "due_date": _parse_due_date(action_text or raw_text),
+            }
+        )
+        return payload
+
+    if entry_type == "vendor_quote":
+        if not vendor:
+            vendor = _extract_with_pattern(raw_text, r"\bvendor\s+(.+?)(?:\bitem\b|\bprice\b|\bharga\b|\blead\s*time\b|\bproject\b|\d)")
+        lead_time_text = _get_kv_value(pairs, "lead_time", "leadtime")
+        if not lead_time_text:
+            lead_time_text = _extract_with_pattern(raw_text, r"lead\s*time\s*(\d+)")
+        lead_time_days = int(lead_time_text) if lead_time_text and lead_time_text.isdigit() else None
+        item_text = _get_kv_value(pairs, "item") or _extract_with_pattern(raw_text, r"\bitem\s*:?\s*([^\n]+)")
+        if not item_text:
+            item_text = _extract_with_pattern(raw_text, r"\b(booth|printing|stage setup|production)\b")
+        payload.update(
+            {
+                "vendor": vendor.strip() if vendor else vendor,
+                "item": item_text,
+                "price": _parse_money(_get_kv_value(pairs, "price", "harga", "penawaran") or _extract_with_pattern(raw_text, r"\b(?:price|harga)\s*:?\s*([^\n]+)")) or _extract_first_money(raw_text),
+                "lead_time_days": lead_time_days,
+            }
+        )
+        return payload
+
+    if entry_type == "budget":
+        internal_raw = _get_kv_value(pairs, "internal", "internal_total")
+        external_raw = _get_kv_value(pairs, "external", "external_total")
+        payload.update(
+            {
+                "item": _get_kv_value(pairs, "item") or _extract_with_pattern(raw_text, r"\bitem\s*:?\s*([^\n]+)"),
+                "internal_total": _parse_money(internal_raw) or _parse_money(_extract_with_pattern(raw_text, r"\binternal\s*:?\s*([^\n]+)")),
+                "external_total": _parse_money(external_raw) or _parse_money(_extract_with_pattern(raw_text, r"\bexternal\s*:?\s*([^\n]+)")),
+            }
+        )
+        return payload
+
+    if entry_type == "project_update":
+        payload.update(
+            {
+                "status": _get_kv_value(pairs, "status") or _extract_with_pattern(raw_text, r"\bstatus\s*:?\s*([^\n]+)"),
+                "issue": _get_kv_value(pairs, "issue", "blocker", "blockers") or _extract_with_pattern(raw_text, r"\b(?:issue|blocker|risk)\s*:?\s*([^\n]+?)(?:\bnext\s*step\b|$)"),
+                "next_step": _get_kv_value(pairs, "next_step", "next_steps") or _extract_with_pattern(raw_text, r"\bnext\s*step\s*:?\s*([^\n]+)"),
+            }
+        )
+        return payload
+
+    if entry_type == "contact":
+        payload.update(
+            {
+                "name": _get_kv_value(pairs, "name", "full_name", "pic") or _extract_with_pattern(raw_text, r"\b(?:contact|pic)\s*:?\s*([a-zA-Z][^\n,;]+)"),
+                "phone": _get_kv_value(pairs, "phone", "whatsapp"),
+                "email": _get_kv_value(pairs, "email"),
+            }
+        )
+        return payload
+
+    return payload
+
+
+def _validate_ingest_payload(entry_type: str, extracted: dict[str, Any], classifier_confidence: float, provided_confidence: Optional[float]) -> tuple[float, list[str]]:
+    required_map = {
+        "meeting": ["project", "decision", "action", "action_owner", "due_date"],
+        "vendor_quote": ["project", "vendor", "item", "price"],
+        "budget": ["project", "item", "internal_total", "external_total", "vendor"],
+        "project_update": ["project", "status", "issue", "next_step"],
+        "contact": ["name"],
+    }
+    required = required_map.get(entry_type, [])
+    missing_fields: list[str] = []
+    for field_name in required:
+        value = extracted.get(field_name)
+        if value is None:
+            missing_fields.append(field_name)
+            continue
+        if isinstance(value, str) and not value.strip():
+            missing_fields.append(field_name)
+
+    confidence = classifier_confidence
+    if not missing_fields:
+        confidence = max(confidence, 0.92)
+    else:
+        confidence = max(0.45, confidence - (0.12 * len(missing_fields)))
+
+    if provided_confidence is not None:
+        confidence = min(confidence, max(0.0, min(1.0, provided_confidence)))
+
+    return round(confidence, 2), missing_fields
+
+
+def _find_or_create_project(project_ref: str) -> dict[str, Any]:
+    project = fetch_one(
+        """
+        select id, project_code, project_name, status, risk_level
+        from projects
+        where project_code ilike %s or project_name ilike %s
+        order by updated_at desc nulls last
+        limit 1
+        """,
+        (project_ref, project_ref),
+    )
+    if project:
+        return project
+
+    code = project_ref.upper()
+    created = fetch_one(
+        """
+        insert into projects (project_code, project_name, status, last_updated)
+        values (%s, %s, 'active', now())
+        returning id, project_code, project_name, status, risk_level
+        """,
+        (code, code),
+    )
+    return created
+
+
+def _ensure_entity(entity_type: str, display_name: str) -> dict[str, Any]:
+    normalized_name = re.sub(r"[^a-z0-9]+", "_", display_name.lower()).strip("_")[:120] or display_name.lower()
+    return fetch_one(
+        """
+        insert into entities (entity_type, name, display_name)
+        values (%s, %s, %s)
+        on conflict (entity_type, name)
+        do update set display_name = excluded.display_name, updated_at = now()
+        returning id, entity_type, name, display_name
+        """,
+        (entity_type, normalized_name, display_name),
+    )
+
+
+def _ensure_vendor(vendor_name: str) -> dict[str, Any]:
+    entity = _ensure_entity("vendor", vendor_name)
+    vendor = fetch_one(
+        """
+        insert into vendors (entity_id, vendor_category)
+        values (%s, 'general')
+        on conflict (entity_id)
+        do update set updated_at = now()
+        returning id, entity_id, vendor_category
+        """,
+        (entity["id"],),
+    )
+    vendor["vendor_name"] = entity["display_name"]
+    return vendor
+
+
+def _find_or_create_client(client_name: str) -> dict[str, Any]:
+    existing = fetch_one(
+        """
+        select c.id, c.entity_id, e.display_name
+        from clients c
+        join entities e on e.id = c.entity_id
+        where e.display_name ilike %s
+        order by c.updated_at desc nulls last
+        limit 1
+        """,
+        (client_name,),
+    )
+    if existing:
+        return existing
+
+    entity = _ensure_entity("client", client_name)
+    return fetch_one(
+        """
+        insert into clients (entity_id, relationship_status)
+        values (%s, 'active')
+        on conflict (entity_id)
+        do update set updated_at = now()
+        returning id, entity_id
+        """,
+        (entity["id"],),
+    )
+
+
+def _create_source(req: IngestRequest, entry_type: str, extracted: dict[str, Any]) -> dict[str, Any]:
+    return fetch_one(
+        """
+        insert into sources (source_type, source_name, channel_name, sender_identifier, raw_reference, metadata)
+        values (%s, %s, %s, %s, %s, %s::jsonb)
+        returning id, source_type, source_name, channel_name
+        """,
+        (
+            req.source_type,
+            req.source_name or f"{req.channel}_ingest",
+            req.channel,
+            req.user_id,
+            req.raw_text,
+            _to_json({"entry_type": entry_type, "extracted": extracted, "role": req.role}),
+        ),
+    )
+
+
+def _write_project_update(req: IngestRequest, extracted: dict[str, Any], source_id: str) -> dict[str, Any]:
+    project = _find_or_create_project(extracted["project"])
+    row = fetch_one(
+        """
+        insert into project_updates (project_id, update_date, update_type, status, summary, blockers, next_steps, source_id, confidence)
+        values (%s, now(), 'manager_entry', %s, %s, %s, %s, %s, %s)
+        returning id, project_id, status
+        """,
+        (
+            project["id"],
+            extracted.get("status"),
+            extracted.get("issue"),
+            extracted.get("issue"),
+            extracted.get("next_step"),
+            source_id,
+            extracted.get("confidence"),
+        ),
+    )
+    execute(
+        """
+        update projects
+        set status = coalesce(%s, status),
+            risk_level = case when lower(coalesce(%s, '')) like '%%risk%%' then 'high' else risk_level end,
+            latest_summary = coalesce(%s, latest_summary),
+            last_updated = now()
+        where id = %s
+        """,
+        (extracted.get("status"), extracted.get("status"), extracted.get("issue"), project["id"]),
+    )
+    return {
+        "project_id": project["id"],
+        "project_code": project.get("project_code"),
+        "project_update_id": row["id"],
+    }
+
+
+def _write_vendor_quote(req: IngestRequest, extracted: dict[str, Any], source_id: str) -> dict[str, Any]:
+    vendor = _ensure_vendor(extracted["vendor"])
+    if extracted.get("project"):
+        _find_or_create_project(extracted["project"])
+    ratecard = fetch_one(
+        """
+        insert into ratecards (vendor_id, item_name, item_category, external_price, lead_time_days, approval_status)
+        values (%s, %s, 'vendor_quote', %s, %s, 'pending_review')
+        returning id, vendor_id, approval_status
+        """,
+        (
+            vendor["id"],
+            extracted.get("item"),
+            extracted.get("price"),
+            extracted.get("lead_time_days"),
+        ),
+    )
+    return {
+        "vendor_id": vendor["id"],
+        "vendor": vendor["vendor_name"],
+        "ratecard_id": ratecard["id"],
+    }
+
+
+def _write_budget(req: IngestRequest, extracted: dict[str, Any], source_id: str) -> dict[str, Any]:
+    project = _find_or_create_project(extracted["project"])
+    vendor_id = None
+    if extracted.get("vendor"):
+        vendor_id = _ensure_vendor(extracted["vendor"])["id"]
+
+    total_internal = extracted.get("internal_total")
+    total_external = extracted.get("external_total")
+    total_profit = None
+    profit_percent = None
+    if total_internal is not None and total_external is not None:
+        total_profit = total_external - total_internal
+        if total_external:
+            profit_percent = round((total_profit / total_external) * 100, 2)
+
+    budget_version = f"entry-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
+    budget = fetch_one(
+        """
+        insert into budgets (project_id, budget_version, budget_status, total_internal, total_external, total_profit, profit_percent)
+        values (%s, %s, 'draft', %s, %s, %s, %s)
+        returning id, budget_version
+        """,
+        (project["id"], budget_version, total_internal, total_external, total_profit, profit_percent),
+    )
+
+    item = fetch_one(
+        """
+        insert into budget_items (budget_id, item_category, item_name, internal_total, external_total, profit, profit_percent, vendor_id)
+        values (%s, 'manual_entry', %s, %s, %s, %s, %s, %s)
+        returning id, budget_id
+        """,
+        (budget["id"], extracted.get("item"), total_internal, total_external, total_profit, profit_percent, vendor_id),
+    )
+    return {
+        "project_id": project["id"],
+        "vendor_id": vendor_id,
+        "budget_id": budget["id"],
+        "budget_item_id": item["id"],
+        "budget_version": budget["budget_version"],
+    }
+
+
+def _write_meeting(req: IngestRequest, extracted: dict[str, Any], source_id: str) -> dict[str, Any]:
+    project = _find_or_create_project(extracted["project"])
+    client_id = None
+    if extracted.get("client"):
+        client_id = _find_or_create_client(extracted["client"])["id"]
+
+    meeting = fetch_one(
+        """
+        insert into meetings (meeting_title, meeting_date, client_id, project_id, summary)
+        values (%s, now(), %s, %s, %s)
+        returning id
+        """,
+        (f"Entry meeting {project.get('project_code')}", client_id, project["id"], extracted.get("summary")),
+    )
+    decision = fetch_one(
+        """
+        insert into decisions (meeting_id, project_id, decision_text, decision_date, confidence)
+        values (%s, %s, %s, current_date, %s)
+        returning id
+        """,
+        (meeting["id"], project["id"], extracted.get("decision"), extracted.get("confidence")),
+    )
+    action = fetch_one(
+        """
+        insert into action_items (meeting_id, project_id, task_text, due_date, status, priority, source_id)
+        values (%s, %s, %s, %s, 'open', 'high', %s)
+        returning id
+        """,
+        (meeting["id"], project["id"], extracted.get("action"), extracted.get("due_date"), source_id),
+    )
+    project_update = fetch_one(
+        """
+        insert into project_updates (project_id, update_date, update_type, status, summary, blockers, next_steps, source_id, confidence)
+        values (%s, now(), 'meeting_summary', 'at_risk', %s, %s, %s, %s, %s)
+        returning id
+        """,
+        (
+            project["id"],
+            extracted.get("summary"),
+            extracted.get("summary"),
+            extracted.get("action"),
+            source_id,
+            extracted.get("confidence"),
+        ),
+    )
+    return {
+        "meeting_id": meeting["id"],
+        "decision_id": decision["id"],
+        "action_item_id": action["id"],
+        "project_update_id": project_update["id"],
+    }
+
+
+def _write_contact(req: IngestRequest, extracted: dict[str, Any], source_id: str) -> dict[str, Any]:
+    entity = _ensure_entity("person", extracted["name"])
+    client_id = None
+    if extracted.get("client"):
+        client_id = _find_or_create_client(extracted["client"])["id"]
+    contact = fetch_one(
+        """
+        insert into contacts (entity_id, client_id, full_name, company, phone, email, whatsapp, confidentiality, notes)
+        values (%s, %s, %s, %s, %s, %s, %s, 'internal', %s)
+        returning id, full_name
+        """,
+        (
+            entity["id"],
+            client_id,
+            extracted["name"],
+            extracted.get("client"),
+            extracted.get("phone"),
+            extracted.get("email"),
+            extracted.get("phone"),
+            f"source_id:{source_id}",
+        ),
+    )
+    return {
+        "entity_id": entity["id"],
+        "contact_id": contact["id"],
+        "contact_name": contact["full_name"],
+    }
+
+
+def _write_ingest_records(req: IngestRequest, entry_type: str, extracted: dict[str, Any]) -> dict[str, Any]:
+    source = _create_source(req, entry_type, extracted)
+    _log_audit(req.user_id, "insert", "sources", source["id"], None, source)
+
+    if entry_type == "project_update":
+        records = _write_project_update(req, extracted, source["id"])
+        _log_audit(req.user_id, "update", "projects", records["project_id"], None, records)
+        _log_audit(req.user_id, "insert", "project_updates", records["project_update_id"], None, records)
+        return records
+    if entry_type == "vendor_quote":
+        records = _write_vendor_quote(req, extracted, source["id"])
+        _log_audit(req.user_id, "upsert", "vendors", records["vendor_id"], None, records)
+        _log_audit(req.user_id, "insert", "ratecards", records["ratecard_id"], None, records)
+        return records
+    if entry_type == "budget":
+        records = _write_budget(req, extracted, source["id"])
+        _log_audit(req.user_id, "upsert", "projects", records["project_id"], None, records)
+        if records.get("vendor_id"):
+            _log_audit(req.user_id, "upsert", "vendors", records["vendor_id"], None, records)
+        _log_audit(req.user_id, "insert", "budgets", records["budget_id"], None, records)
+        _log_audit(req.user_id, "insert", "budget_items", records["budget_item_id"], None, records)
+        return records
+    if entry_type == "meeting":
+        records = _write_meeting(req, extracted, source["id"])
+        _log_audit(req.user_id, "insert", "meetings", records["meeting_id"], None, records)
+        _log_audit(req.user_id, "insert", "decisions", records["decision_id"], None, records)
+        _log_audit(req.user_id, "insert", "action_items", records["action_item_id"], None, records)
+        _log_audit(req.user_id, "insert", "project_updates", records["project_update_id"], None, records)
+        return records
+    if entry_type == "contact":
+        records = _write_contact(req, extracted, source["id"])
+        _log_audit(req.user_id, "upsert", "entities", records["entity_id"], None, records)
+        _log_audit(req.user_id, "insert", "contacts", records["contact_id"], None, records)
+        return records
+
+    raise ValueError(f"Unsupported entry_type: {entry_type}")
+
+
+def _ingest_message(entry_type: str, records_created: dict[str, Any]) -> str:
+    if entry_type == "vendor_quote":
+        return "Vendor quote saved as pending approval."
+    if entry_type == "project_update":
+        return f"Project {records_created.get('project_code', '')} updated."
+    if entry_type == "meeting":
+        return "Meeting saved. 1 decision and 1 action item created."
+    if entry_type == "budget":
+        return "Budget entry saved as draft."
+    if entry_type == "contact":
+        return "Contact saved."
+    return "Entry saved."
+
+
 @app.get("/health")
 def health(_: bool = Depends(require_auth)):
     return {
@@ -615,6 +1212,58 @@ def brain_query(req: BrainQueryRequest, _: bool = Depends(require_auth)):
         _cache_set(cache_key, ttl_seconds, response.copy())
 
     return response
+
+
+@app.post("/ingest")
+def ingest(req: IngestRequest, _: bool = Depends(require_auth)):
+    entry_type, classifier_confidence = _extract_entry_type(req.raw_text, req.entry_type)
+    if not entry_type:
+        return {
+            "status": "needs_confirmation",
+            "entry_type": None,
+            "confidence": 0.0,
+            "missing_fields": ["entry_type"],
+            "message": "Entry type belum jelas. Gunakan /entry meeting, /entry vendor_quote, /entry budget, /entry project_update, atau /entry contact.",
+        }
+
+    extracted = req.extracted if req.extracted else _extract_ingest_payload(entry_type, req.raw_text)
+    confidence, missing_fields = _validate_ingest_payload(entry_type, extracted, classifier_confidence, req.confidence)
+    extracted["confidence"] = confidence
+    extracted["confidentiality"] = (
+        "confidential"
+        if entry_type in {"vendor_quote", "budget"}
+        else "restricted"
+        if any(term in req.raw_text.lower() for term in ["legal", "ip", "nda", "patent"])
+        else "internal"
+    )
+
+    if confidence < 0.85:
+        return {
+            "status": "needs_confirmation",
+            "entry_type": entry_type,
+            "confidence": confidence,
+            "extracted": extracted,
+            "missing_fields": missing_fields,
+            "message": f"Mohon lengkapi field: {', '.join(missing_fields)}.",
+        }
+
+    records_created = _write_ingest_records(req, entry_type, extracted)
+    _log_query(
+        req.user_id,
+        req.raw_text,
+        "ingestion",
+        ["ingest", entry_type],
+        len(records_created),
+        0,
+        f"ingest:{entry_type}",
+    )
+    return {
+        "status": "saved",
+        "entry_type": entry_type,
+        "confidence": confidence,
+        "records_created": records_created,
+        "message": _ingest_message(entry_type, records_created),
+    }
 
 
 @app.post("/search_db")

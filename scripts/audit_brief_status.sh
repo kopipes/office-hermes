@@ -113,6 +113,18 @@ if [[ -f "$SKILL_FILE" ]]; then
   done
 fi
 
+INGEST_SKILL_FILE="$HERMES_HOME/skills/provaliant-brain-os-ingest/SKILL.md"
+if [[ -f "$INGEST_SKILL_FILE" ]]; then
+  pass "Ingest skill file exists: $INGEST_SKILL_FILE"
+  if grep -q "/ingest" "$INGEST_SKILL_FILE"; then
+    pass "Ingest skill contains /ingest endpoint template"
+  else
+    warn "Ingest skill exists but /ingest template not found"
+  fi
+else
+  warn "Ingest skill file missing: $INGEST_SKILL_FILE"
+fi
+
 print_header "Systemd Services"
 if systemctl --user is-active hermes-gateway.service >/dev/null 2>&1; then
   pass "hermes-gateway.service is active"
@@ -183,6 +195,13 @@ if [[ -n "${MCP_API_KEY:-}" ]]; then
     pass "POST /brain/query returned HTTP 200"
   else
     fail "POST /brain/query returned HTTP $CODE: $(cat /tmp/audit_api_body.out)"
+  fi
+
+  CODE="$(http_code POST "$API_BASE/ingest" "$MCP_API_KEY" '{"user_id":"donna","role":"manager","channel":"telegram","raw_text":"/entry project_update Project CPP status at risk issue vendor delay 2 days next step Hueny confirm delivery tomorrow"}')"
+  if [[ "$CODE" == "200" ]]; then
+    pass "POST /ingest returned HTTP 200"
+  else
+    fail "POST /ingest returned HTTP $CODE: $(cat /tmp/audit_api_body.out)"
   fi
 fi
 

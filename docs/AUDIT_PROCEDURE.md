@@ -9,7 +9,9 @@ Audit ini memverifikasi:
 - Primary model + fallback OpenRouter sesuai konfigurasi brief.
 - Gateway Telegram aktif.
 - Skill lokal `provaliant-brain-os-query` terpasang.
+- Skill lokal `provaliant-brain-os-ingest` terpasang.
 - MCP API server aktif dan endpoint inti merespons, termasuk `POST /brain/query`.
+- Endpoint ingestion `POST /ingest` merespons.
 - Database Provaliant siap (schema utama + extension vector + tabel audit/query logs).
 - Smoke test one-shot model (opsional) berhasil.
 
@@ -50,6 +52,7 @@ Audit dinyatakan **lulus** jika:
   - gateway + mcp service active
   - API health + endpoint inti HTTP `200`
   - `POST /brain/query` HTTP `200`
+  - `POST /ingest` HTTP `200`
   - DB schema dasar bisa di-query
 
 ## Checklist Manual Tambahan (UAT via Telegram)
