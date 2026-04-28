@@ -127,7 +127,7 @@ def _log_audit(user_id: Optional[str], action_type: str, table_name: str, record
 def _to_json(value: Optional[dict]) -> str:
     import json
 
-    return json.dumps(value or {})
+    return json.dumps(value or {}, default=str)
 
 
 def _normalize_query(query: str) -> str:
@@ -722,7 +722,7 @@ def _extract_ingest_payload(entry_type: str, raw_text: str) -> dict[str, Any]:
 
     if entry_type == "vendor_quote":
         if not vendor:
-            vendor = _extract_with_pattern(raw_text, r"\bvendor\s+(.+?)(?:\bitem\b|\bprice\b|\bharga\b|\blead\s*time\b|\bproject\b|\d)")
+            vendor = _extract_with_pattern(raw_text, r"\bvendor\s+(.+?)(?:\bitem\b|\bprice\b|\bharga\b|\blead\s*time\b|\bproject\b|\bbooth\b|\bprinting\b|\bstage\b|\d)")
         lead_time_text = _get_kv_value(pairs, "lead_time", "leadtime")
         if not lead_time_text:
             lead_time_text = _extract_with_pattern(raw_text, r"lead\s*time\s*(\d+)")
@@ -741,10 +741,13 @@ def _extract_ingest_payload(entry_type: str, raw_text: str) -> dict[str, Any]:
         return payload
 
     if entry_type == "budget":
+        if not vendor:
+            vendor = _extract_with_pattern(raw_text, r"\bvendor\s+(.+?)(?:\bitem\b|\binternal\b|\bexternal\b|$)")
         internal_raw = _get_kv_value(pairs, "internal", "internal_total")
         external_raw = _get_kv_value(pairs, "external", "external_total")
         payload.update(
             {
+                "vendor": vendor.strip() if vendor else vendor,
                 "item": _get_kv_value(pairs, "item") or _extract_with_pattern(raw_text, r"\bitem\s*:?\s*([^\n]+)"),
                 "internal_total": _parse_money(internal_raw) or _parse_money(_extract_with_pattern(raw_text, r"\binternal\s*:?\s*([^\n]+)")),
                 "external_total": _parse_money(external_raw) or _parse_money(_extract_with_pattern(raw_text, r"\bexternal\s*:?\s*([^\n]+)")),
