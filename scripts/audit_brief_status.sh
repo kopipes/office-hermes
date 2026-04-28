@@ -104,7 +104,7 @@ if [[ -f "$SKILL_FILE" ]]; then
     fail "Skill auth header format invalid (Bearer not found)"
   fi
 
-  for endpoint in "/get_project" "/search_db" "/generate_report"; do
+  for endpoint in "/brain/query" "/get_project" "/search_db" "/generate_report"; do
     if grep -q "$endpoint" "$SKILL_FILE"; then
       pass "Skill contains endpoint template $endpoint"
     else
@@ -176,6 +176,13 @@ if [[ -n "${MCP_API_KEY:-}" ]]; then
     pass "POST /generate_report returned HTTP 200"
   else
     fail "POST /generate_report returned HTTP $CODE: $(cat /tmp/audit_api_body.out)"
+  fi
+
+  CODE="$(http_code POST "$API_BASE/brain/query" "$MCP_API_KEY" '{"query":"What is the latest status of CPP?","user_id":"donna","role":"admin","channel":"telegram"}')"
+  if [[ "$CODE" == "200" ]]; then
+    pass "POST /brain/query returned HTTP 200"
+  else
+    fail "POST /brain/query returned HTTP $CODE: $(cat /tmp/audit_api_body.out)"
   fi
 fi
 

@@ -38,6 +38,7 @@ bash scripts/run_mcp.sh
 
 ## Core MCP Endpoints
 - `GET /health`
+- `POST /brain/query`
 - `POST /search_db`
 - `POST /search_wiki`
 - `POST /search_evidence`
@@ -53,3 +54,5 @@ Semua endpoint memerlukan header:
 ```text
 Authorization: Bearer <MCP_API_KEY>
 ```
+
+`POST /brain/query` adalah jalur orkestrator utama untuk Donna / Hermes. Endpoint ini menangani intent classification, entity extraction, cache, tool routing, dan answer formatting sebelum fallback ke raw endpoints.
