@@ -8,6 +8,13 @@ Use the Brain OS Query Orchestrator endpoint as the single safe entrypoint for o
 - Prefer `POST /brain/query` instead of raw MCP tools.
 - Let the orchestrator classify intent, extract entities, check cache, choose tool, and format the answer.
 - Only fall back to raw endpoints if `/brain/query` is unavailable.
+- When the user asks about Provaliant projects, vendors, budgets, action items, wiki, evidence, or reports, you MUST treat it as Brain OS domain work and use this skill first.
+- Treat short codes like `CPP`, `SNP`, and similar uppercase project codes as Brain OS project identifiers, not generic technical acronyms.
+- Answer in this format:
+  - `Jawaban singkat`
+  - `Sumber data`
+  - `Status confidence`
+  - `Next action`
 
 ## Bootstrap
 ```bash
@@ -25,6 +32,12 @@ curl -sS "$API_BASE/brain/query" \
   -H "Authorization: Bearer $API_KEY" \
   -d '{"query":"What is the latest status of CPP?","user_id":"donna","role":"admin","channel":"telegram"}' | jq
 ```
+
+## Required Flow
+1. Normalize the user question as Brain OS operational query.
+2. Call `POST /brain/query`.
+3. Use `answer`, `sources`, `tool_used`, and `confidence` from the response.
+4. Do not improvise outside Brain OS data if the endpoint returns a result.
 
 ## Query Examples
 ```bash

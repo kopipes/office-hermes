@@ -134,8 +134,9 @@ def _extract_entities(query: str) -> dict[str, Optional[str]]:
     }
 
     project_patterns = [
-        r"(?:/status|status|project|budget)\s+([a-z0-9_-]{2,20})",
         r"(?:status of|budget for|project status for)\s+([a-z0-9_-]{2,20})",
+        r"(?:/status|/budget)\s+([a-z0-9_-]{2,20})",
+        r"(?:project|budget)\s+([a-z0-9_-]{2,20})",
     ]
     for pattern in project_patterns:
         match = re.search(pattern, normalized)
