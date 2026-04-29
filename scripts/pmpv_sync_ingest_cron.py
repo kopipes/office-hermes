@@ -98,9 +98,23 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def get_project_number_column(conn: sqlite3.Connection) -> str:
+    cur = conn.cursor()
+    rows = cur.execute("pragma table_info(projects)").fetchall()
+    cols = {row[1] for row in rows}
+    if "project_number" in cols:
+        return "project_number"
+    if "number" in cols:
+        return "number"
+    cur.execute("alter table projects add column number text")
+    conn.commit()
+    return "number"
+
+
 def upsert_cache(conn: sqlite3.Connection, moms: list[dict[str, Any]], projects: list[dict[str, Any]]) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
     cur = conn.cursor()
+    project_number_column = get_project_number_column(conn)
     for mom in moms:
         cur.execute(
             """
@@ -124,11 +138,11 @@ def upsert_cache(conn: sqlite3.Connection, moms: list[dict[str, Any]], projects:
         )
     for proj in projects:
         cur.execute(
-            """
-            insert into projects (id, project_number, title, status, raw_json, synced_at)
+            f"""
+            insert into projects (id, {project_number_column}, title, status, raw_json, synced_at)
             values (?, ?, ?, ?, ?, ?)
             on conflict(id) do update set
-              project_number=excluded.project_number,
+              {project_number_column}=excluded.{project_number_column},
               title=excluded.title,
               status=excluded.status,
               raw_json=excluded.raw_json,
