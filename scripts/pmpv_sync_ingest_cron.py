@@ -98,6 +98,17 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
+def ensure_table_columns(conn: sqlite3.Connection, table_name: str, expected: dict[str, str]) -> None:
+    cur = conn.cursor()
+    rows = cur.execute(f"pragma table_info({table_name})").fetchall()
+    cols = {row[1] for row in rows}
+    for col, definition in expected.items():
+        if col in cols:
+            continue
+        cur.execute(f"alter table {table_name} add column {col} {definition}")
+    conn.commit()
+
+
 def get_project_number_column(conn: sqlite3.Connection) -> str:
     cur = conn.cursor()
     rows = cur.execute("pragma table_info(projects)").fetchall()
@@ -114,6 +125,27 @@ def get_project_number_column(conn: sqlite3.Connection) -> str:
 def upsert_cache(conn: sqlite3.Connection, moms: list[dict[str, Any]], projects: list[dict[str, Any]]) -> None:
     now_iso = datetime.now(timezone.utc).isoformat()
     cur = conn.cursor()
+    ensure_table_columns(
+        conn,
+        "moms",
+        {
+            "title": "text",
+            "meeting_date": "text",
+            "client_name": "text",
+            "raw_json": "text",
+            "synced_at": "text",
+        },
+    )
+    ensure_table_columns(
+        conn,
+        "projects",
+        {
+            "title": "text",
+            "status": "text",
+            "raw_json": "text",
+            "synced_at": "text",
+        },
+    )
     project_number_column = get_project_number_column(conn)
     for mom in moms:
         cur.execute(
